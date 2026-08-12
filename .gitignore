@@ -1,0 +1,22 @@
+# Portable Android emulator for TSD apps (andemu)
+#
+# Heavy / generated — never commit
+runtime/**
+!runtime/.gitkeep
+avd/**
+!avd/.gitkeep
+.android/
+logs/**
+!logs/.gitkeep
+dist/**
+!dist/.gitkeep
+*.zip
+*.log
+*.apk
+!app/.gitkeep
+
+# Local overrides
+config.local.json
+.DS_Store
+Thumbs.db
+desktop.ini

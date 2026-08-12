@@ -1,0 +1,25 @@
+{
+  "appName": "TSD Process Emulator",
+  "apkFileName": "Axelot-Start-1.0.1.10.apk",
+  "apkPackage": "ru.axelot.mobileupdater",
+
+  "androidVersion": 30,
+  "androidApi": "android-30",
+  "systemImage": "system-images;android-30;google_apis;x86_64",
+
+  "avdName": "TSD_AVD",
+  "screenWidth": 1080,
+  "screenHeight": 1920,
+  "screenDpi": 480,
+  "ramMb": 4096,
+
+  "emulatorArgs": [
+    "-no-snapshot-save",
+    "-no-snapshot-load",
+    "-gpu",
+    "swiftshader_indirect"
+  ],
+
+  "hideEmulatorToolbarOnStart": true,
+  "disableEmulatorRotate": true
+}
