@@ -97,28 +97,41 @@ function Install-CommandLineTools {
     try {
         # Архив живёт в runtime\cache до успешного конца setup (не удаляем при ошибке)
         $zipPath = Get-AndemuCachedZip -Root $Root -FileName $ZipFileName -Url $ZipUrl -MinBytes 10MB
-        $workDir = New-AndemuTempDir -Root $Root -Prefix 'cmdline-extract'
+
+        # Короткий stage рядом с SDK — меньше MAX_PATH, чем Downloads\...\runtime\.tmp\cmdline-extract-<guid>
+        Ensure-Directory (Join-Path $SdkRoot 'cmdline-tools')
+        $workDir = Join-Path $SdkRoot 'cmdline-tools\s'
+        if (Test-Path -LiteralPath $workDir) {
+            Remove-AndemuTempDir -Path $workDir
+        }
+        New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
         Write-Info "Распаковываю архив..."
-        Expand-Archive -LiteralPath $zipPath -DestinationPath $workDir -Force
+        Expand-AndemuZip -ZipPath $zipPath -Destination $workDir
 
         $extracted = Join-Path $workDir 'cmdline-tools'
         if (-not (Test-Path -LiteralPath $extracted)) {
-            throw "В архиве не найдена папка cmdline-tools"
+            # иногда zip уже «плоский» (bin/lib в корне)
+            if (Test-Path -LiteralPath (Join-Path $workDir 'bin\sdkmanager.bat')) {
+                $extracted = $workDir
+            } else {
+                throw "В архиве не найдена папка cmdline-tools"
+            }
         }
 
-        Ensure-Directory (Join-Path $SdkRoot 'cmdline-tools')
         if (Test-Path -LiteralPath $latestDir) {
-            Remove-Item -LiteralPath $latestDir -Recurse -Force
+            Remove-AndemuTempDir -Path $latestDir
         }
-        Copy-Item -LiteralPath $extracted -Destination $latestDir -Recurse -Force
+        Move-Item -LiteralPath $extracted -Destination $latestDir
         if (-not (Test-Path -LiteralPath $sdkmanager)) {
             throw "После распаковки не найден sdkmanager.bat"
         }
         Write-Ok "Command-line tools установлены"
     } finally {
-        # Кэш-zip не трогаем — только папку распаковки
-        Remove-AndemuTempDir -Path $workDir
+        # Кэш-zip не трогаем — только stage. Если extracted переехал в latest, workDir может остаться пустым/частичным.
+        if ($workDir -and (Test-Path -LiteralPath $workDir)) {
+            Remove-AndemuTempDir -Path $workDir
+        }
     }
 }
 

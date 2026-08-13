@@ -297,10 +297,10 @@ function Install-PortableTemurinJdk {
     $workDir = $null
     try {
         $zipPath = Get-AndemuCachedZip -Root $Root -FileName 'temurin-jdk-17.zip' -Url $ZipUrl -MinBytes 20MB
-        $workDir = New-AndemuTempDir -Root $Root -Prefix 'jdk-extract'
+        $workDir = New-AndemuTempDir -Root $Root -Prefix 'j'
 
         Write-Info 'Распаковываю JDK...'
-        Expand-Archive -LiteralPath $zipPath -DestinationPath $workDir -Force
+        Expand-AndemuZip -ZipPath $zipPath -Destination $workDir
 
         $extractedHome = Get-ChildItem -LiteralPath $workDir -Directory |
             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'bin\java.exe') } |
@@ -357,20 +357,23 @@ function Ensure-AndemuJdk {
 function New-AndemuTempDir {
     <#
     .SYNOPSIS
-      Временная папка внутри проекта (runtime\.tmp), без %TEMP% и 8.3-путей профиля.
+      Короткая временная папка (runtime\t\xxxxxxxx) — меньше шансов упереться в MAX_PATH.
     #>
     param(
         [Parameter(Mandatory = $true)]
         [string]$Root,
 
-        [string]$Prefix = 'tmp'
+        [string]$Prefix = 't'
     )
 
-    $base = Join-Path $Root 'runtime\.tmp'
+    # Короткое имя: runtime\t\a1b2c3d4 (не .tmp\cmdline-extract-<guid>)
+    $base = Join-Path $Root 'runtime\t'
     if (-not (Test-Path -LiteralPath $base)) {
         New-Item -ItemType Directory -Path $base -Force | Out-Null
     }
-    $dir = Join-Path $base ($Prefix + '-' + [guid]::NewGuid().ToString('N'))
+    $tag = ([guid]::NewGuid().ToString('N')).Substring(0, 8)
+    $name = if ($Prefix -and $Prefix.Length -le 2) { $Prefix + $tag } else { $tag }
+    $dir = Join-Path $base $name
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     return [System.IO.Path]::GetFullPath($dir)
 }
@@ -388,6 +391,84 @@ function Remove-AndemuTempDir {
             Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
         }
     } catch {}
+}
+
+function Expand-AndemuZip {
+    <#
+    .SYNOPSIS
+      Распаковка zip без Expand-Archive (PS 5.1 ломается на длинных путях Android cmdline-tools).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ZipPath,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    $zipFull = [System.IO.Path]::GetFullPath($ZipPath)
+    if (-not (Test-Path -LiteralPath $zipFull)) {
+        throw "ZIP не найден: $zipFull"
+    }
+
+    $destFull = [System.IO.Path]::GetFullPath($Destination)
+    if (-not (Test-Path -LiteralPath $destFull)) {
+        New-Item -ItemType Directory -Path $destFull -Force | Out-Null
+    }
+
+    # Windows 10+ tar обычно лучше переносит длинные пути, чем Expand-Archive
+    $tar = Get-Command tar.exe -ErrorAction SilentlyContinue
+    if ($tar) {
+        $p = Start-Process -FilePath $tar.Source -ArgumentList @('-xf', $zipFull, '-C', $destFull) -Wait -PassThru -WindowStyle Hidden
+        if ($p.ExitCode -eq 0) {
+            return
+        }
+        Write-Warn "tar вернул код $($p.ExitCode), пробую .NET ZipFile..."
+    }
+
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($zipFull)
+    try {
+        foreach ($entry in $zip.Entries) {
+            $rel = ($entry.FullName -replace '/', '\').TrimStart('\')
+            if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+
+            $target = [System.IO.Path]::GetFullPath((Join-Path $destFull $rel))
+            $destPrefix = $destFull.TrimEnd('\') + '\'
+            if (-not ($target.Equals($destFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+                      $target.StartsWith($destPrefix, [System.StringComparison]::OrdinalIgnoreCase))) {
+                throw "Небезопасный путь в ZIP: $($entry.FullName)"
+            }
+
+            $isDir = $rel.EndsWith('\') -or [string]::IsNullOrEmpty($entry.Name)
+            if ($isDir) {
+                if (-not [System.IO.Directory]::Exists($target)) {
+                    [void][System.IO.Directory]::CreateDirectory($target)
+                }
+                continue
+            }
+
+            $parent = [System.IO.Path]::GetDirectoryName($target)
+            if ($parent -and -not [System.IO.Directory]::Exists($parent)) {
+                [void][System.IO.Directory]::CreateDirectory($parent)
+            }
+
+            # \\?\ обходит лимит MAX_PATH=260
+            $outPath = if ($target.Length -ge 240) { '\\?\' + $target } else { $target }
+            $inStream = $entry.Open()
+            try {
+                $outStream = [System.IO.File]::Create($outPath)
+                try {
+                    $inStream.CopyTo($outStream)
+                } finally {
+                    $outStream.Dispose()
+                }
+            } finally {
+                $inStream.Dispose()
+            }
+        }
+    } finally {
+        $zip.Dispose()
+    }
 }
 
 function Get-AndemuCacheDir {
@@ -454,13 +535,17 @@ function Clear-AndemuSetupCache {
     param([Parameter(Mandatory = $true)][string]$Root)
 
     $cacheDir = Join-Path $Root 'runtime\cache'
-    $tmpDir = Join-Path $Root 'runtime\.tmp'
+    $tmpDir = Join-Path $Root 'runtime\t'
+    $legacyTmp = Join-Path $Root 'runtime\.tmp'
     if (Test-Path -LiteralPath $cacheDir) {
         Write-Info "Очищаю кэш загрузок: $cacheDir"
         Remove-AndemuTempDir -Path $cacheDir
     }
     if (Test-Path -LiteralPath $tmpDir) {
         Remove-AndemuTempDir -Path $tmpDir
+    }
+    if (Test-Path -LiteralPath $legacyTmp) {
+        Remove-AndemuTempDir -Path $legacyTmp
     }
 }
 
