@@ -80,8 +80,10 @@ function Get-AvdManager {
 
 function Install-CommandLineTools {
     param(
+        [string]$Root,
         [string]$SdkRoot,
-        [string]$ZipUrl = 'https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip'
+        [string]$ZipUrl = 'https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip',
+        [string]$ZipFileName = 'commandlinetools-win-11076708_latest.zip'
     )
 
     $latestDir = Join-Path $SdkRoot 'cmdline-tools\latest'
@@ -91,26 +93,16 @@ function Install-CommandLineTools {
         return
     }
 
-    Write-Info "Скачиваю Android Command-line Tools..."
-    Write-Info "URL: $ZipUrl"
-
-    $tempDir = Join-Path $env:TEMP ("tsd-emulator-setup-" + [guid]::NewGuid().ToString('N'))
-    Ensure-Directory $tempDir
-    $zipPath = Join-Path $tempDir 'commandlinetools.zip'
-
+    $workDir = $null
     try {
-        try {
-            # TLS 1.2 для старых PowerShell
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $ZipUrl -OutFile $zipPath -UseBasicParsing
-        } catch {
-            throw "Не удалось скачать command-line tools. Проверьте интернет и доступ к dl.google.com. $($_.Exception.Message)"
-        }
+        # Архив живёт в runtime\cache до успешного конца setup (не удаляем при ошибке)
+        $zipPath = Get-AndemuCachedZip -Root $Root -FileName $ZipFileName -Url $ZipUrl -MinBytes 10MB
+        $workDir = New-AndemuTempDir -Root $Root -Prefix 'cmdline-extract'
 
         Write-Info "Распаковываю архив..."
-        Expand-Archive -LiteralPath $zipPath -DestinationPath $tempDir -Force
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $workDir -Force
 
-        $extracted = Join-Path $tempDir 'cmdline-tools'
+        $extracted = Join-Path $workDir 'cmdline-tools'
         if (-not (Test-Path -LiteralPath $extracted)) {
             throw "В архиве не найдена папка cmdline-tools"
         }
@@ -119,16 +111,14 @@ function Install-CommandLineTools {
         if (Test-Path -LiteralPath $latestDir) {
             Remove-Item -LiteralPath $latestDir -Recurse -Force
         }
-        Move-Item -LiteralPath $extracted -Destination $latestDir
-
+        Copy-Item -LiteralPath $extracted -Destination $latestDir -Recurse -Force
         if (-not (Test-Path -LiteralPath $sdkmanager)) {
             throw "После распаковки не найден sdkmanager.bat"
         }
         Write-Ok "Command-line tools установлены"
     } finally {
-        if (Test-Path -LiteralPath $tempDir) {
-            Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        # Кэш-zip не трогаем — только папку распаковки
+        Remove-AndemuTempDir -Path $workDir
     }
 }
 
@@ -355,7 +345,7 @@ try {
     Ensure-Directory (Join-Path $root 'dist')
     Ensure-Directory (Join-Path $root 'logs')
 
-    Install-CommandLineTools -SdkRoot $sdkRoot
+    Install-CommandLineTools -Root $root -SdkRoot $sdkRoot
     Set-SdkEnvironment -SdkRoot $sdkRoot -AvdHome $avdHome
 
     $sdkManager = Get-SdkManager -SdkRoot $sdkRoot
@@ -365,6 +355,14 @@ try {
     Install-SdkPackages -SdkManager $sdkManager -Config $config
     New-TsdAvd -AvdManager $avdManager -Config $config -AvdHome $avdHome
     $null = Update-AndemuAvdDisplay -Config $config -AvdHome $avdHome
+
+    $emulatorExe = Join-Path $sdkRoot 'emulator\emulator.exe'
+    if (-not (Test-Path -LiteralPath $emulatorExe)) {
+        throw "Установка завершилась, но не найден emulator.exe: $emulatorExe"
+    }
+
+    # Архивы JDK/cmdline-tools больше не нужны
+    Clear-AndemuSetupCache -Root $root
 
     Write-Host ''
     Write-Ok 'Установка завершена успешно.'

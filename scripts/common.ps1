@@ -287,26 +287,22 @@ function Install-PortableTemurinJdk {
         }
     }
 
-    Write-Info "Скачиваю portable Eclipse Temurin JDK $Major (~180 MB)..."
-    Write-Info "URL: $ZipUrl"
+    Write-Info "Готовлю portable Eclipse Temurin JDK $Major..."
 
     $runtimeDir = Join-Path $Root 'runtime'
     if (-not (Test-Path -LiteralPath $runtimeDir)) {
         New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
     }
 
-    $tempDir = Join-Path $env:TEMP ('andemu-jdk-' + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-    $zipPath = Join-Path $tempDir 'temurin-jdk.zip'
-
+    $workDir = $null
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $ZipUrl -OutFile $zipPath -UseBasicParsing
+        $zipPath = Get-AndemuCachedZip -Root $Root -FileName 'temurin-jdk-17.zip' -Url $ZipUrl -MinBytes 20MB
+        $workDir = New-AndemuTempDir -Root $Root -Prefix 'jdk-extract'
 
         Write-Info 'Распаковываю JDK...'
-        Expand-Archive -LiteralPath $zipPath -DestinationPath $tempDir -Force
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $workDir -Force
 
-        $extractedHome = Get-ChildItem -LiteralPath $tempDir -Directory |
+        $extractedHome = Get-ChildItem -LiteralPath $workDir -Directory |
             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'bin\java.exe') } |
             Select-Object -First 1
 
@@ -329,7 +325,8 @@ function Install-PortableTemurinJdk {
     } catch {
         throw "Не удалось установить portable JDK. Проверьте интернет и доступ к api.adoptium.net. $($_.Exception.Message)"
     } finally {
-        try { Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+        # Архив в runtime\cache оставляем до успешного конца setup
+        Remove-AndemuTempDir -Path $workDir
     }
 }
 
@@ -355,6 +352,116 @@ function Ensure-AndemuJdk {
     $installed = Install-PortableTemurinJdk -Root $Root -Major $MinMajor
     Set-AndemuJavaEnvironment -JavaHome $installed
     return $installed
+}
+
+function New-AndemuTempDir {
+    <#
+    .SYNOPSIS
+      Временная папка внутри проекта (runtime\.tmp), без %TEMP% и 8.3-путей профиля.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Root,
+
+        [string]$Prefix = 'tmp'
+    )
+
+    $base = Join-Path $Root 'runtime\.tmp'
+    if (-not (Test-Path -LiteralPath $base)) {
+        New-Item -ItemType Directory -Path $base -Force | Out-Null
+    }
+    $dir = Join-Path $base ($Prefix + '-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    return [System.IO.Path]::GetFullPath($dir)
+}
+
+function Remove-AndemuTempDir {
+    param([string]$Path)
+    if (-not $Path) { return }
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            cmd.exe /c "rmdir /s /q `"$Path`"" | Out-Null
+        }
+    } catch {}
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+
+function Get-AndemuCacheDir {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $dir = Join-Path $Root 'runtime\cache'
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    return [System.IO.Path]::GetFullPath($dir)
+}
+
+function Get-AndemuCachedZip {
+    <#
+    .SYNOPSIS
+      Скачивает архив в runtime\cache (или берёт уже скачанный). Не удаляет при ошибках setup.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$FileName,
+        [Parameter(Mandatory = $true)][string]$Url,
+        [long]$MinBytes = 1MB
+    )
+
+    $cacheDir = Get-AndemuCacheDir -Root $Root
+    $zipPath = Join-Path $cacheDir $FileName
+    $partialPath = Join-Path $cacheDir ($FileName + '.partial')
+
+    if (Test-Path -LiteralPath $zipPath) {
+        $len = [long](Get-Item -LiteralPath $zipPath).Length
+        if ($len -ge $MinBytes) {
+            Write-Ok ("Кэш: {0} ({1:N1} MB)" -f $zipPath, ($len / 1MB))
+            return $zipPath
+        }
+        Write-Warn "Кэш повреждён/неполный ($len байт) — скачаю заново"
+        Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Info "Скачиваю в кэш: $FileName"
+    Write-Info "URL: $Url"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        if (Test-Path -LiteralPath $partialPath) {
+            Remove-Item -LiteralPath $partialPath -Force -ErrorAction SilentlyContinue
+        }
+        Invoke-WebRequest -Uri $Url -OutFile $partialPath -UseBasicParsing
+        $len = [long](Get-Item -LiteralPath $partialPath).Length
+        if ($len -lt $MinBytes) {
+            throw "Скачанный файл слишком маленький ($len байт)"
+        }
+        Move-Item -LiteralPath $partialPath -Destination $zipPath -Force
+        Write-Ok ("Сохранено в кэш: {0} ({1:N1} MB)" -f $FileName, ($len / 1MB))
+        return $zipPath
+    } catch {
+        try { Remove-Item -LiteralPath $partialPath -Force -ErrorAction SilentlyContinue } catch {}
+        throw $_
+    }
+}
+
+function Clear-AndemuSetupCache {
+    <#
+    .SYNOPSIS
+      Удаляет кэш загрузок и .tmp только после успешной установки эмулятора.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $cacheDir = Join-Path $Root 'runtime\cache'
+    $tmpDir = Join-Path $Root 'runtime\.tmp'
+    if (Test-Path -LiteralPath $cacheDir) {
+        Write-Info "Очищаю кэш загрузок: $cacheDir"
+        Remove-AndemuTempDir -Path $cacheDir
+    }
+    if (Test-Path -LiteralPath $tmpDir) {
+        Remove-AndemuTempDir -Path $tmpDir
+    }
 }
 
 function Update-AndemuAvdDisplay {
