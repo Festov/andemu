@@ -582,57 +582,105 @@ function Test-AndemuAccelOk {
     return $false
 }
 
-function Install-AndemuAehdDriver {
-    param([string]$SdkRoot)
-
-    $bat = Join-Path $SdkRoot 'extras\google\Android_Emulator_Hypervisor_Driver\silent_install.bat'
-    if (-not (Test-Path -LiteralPath $bat)) {
-        $alt = Get-ChildItem -LiteralPath (Join-Path $SdkRoot 'extras') -Recurse -Filter 'silent_install.bat' -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($alt) { $bat = $alt.FullName }
-    }
-    if (-not (Test-Path -LiteralPath $bat)) {
-        Write-Warn "AEHD silent_install.bat не найден (сначала установите пакет extras;google;Android_Emulator_Hypervisor_Driver)"
-        return $false
-    }
-
-    Write-Info 'Запускаю silent_install.bat AEHD (может запросить права администратора)...'
+function Test-AndemuHyperVPresent {
     try {
-        $p = Start-Process -FilePath $env:ComSpec -ArgumentList @('/c', "`"$bat`"") -Verb RunAs -Wait -PassThru -WindowStyle Normal
-        Write-Info "AEHD silent_install код выхода: $($p.ExitCode)"
-        return ($p.ExitCode -eq 0)
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        return [bool]$cs.HypervisorPresent
     } catch {
-        Write-Warn "Не удалось запустить AEHD installer с повышением прав: $($_.Exception.Message)"
-        Write-Warn "Запустите от администратора: $bat"
         return $false
     }
 }
 
-function Enable-AndemuWhpxFeature {
-    Write-Info 'Пробую включить Windows Hypervisor Platform (WHPX)...'
+function Find-AndemuAehdSilentInstall {
+    param([string]$SdkRoot, [string]$Root)
+
+    $candidates = @()
+    if ($SdkRoot) {
+        $candidates += (Join-Path $SdkRoot 'extras\google\Android_Emulator_Hypervisor_Driver\silent_install.bat')
+        $extras = Join-Path $SdkRoot 'extras'
+        if (Test-Path -LiteralPath $extras) {
+            $candidates += @(Get-ChildItem -LiteralPath $extras -Recurse -Filter 'silent_install.bat' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        }
+    }
+    if ($Root) {
+        $candidates += (Join-Path $Root 'runtime\aehd\silent_install.bat')
+    }
+
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+    }
+    return $null
+}
+
+function Install-AndemuAehdFromGitHub {
+    <#
+    .SYNOPSIS
+      Качает AEHD с GitHub (если нет пакета SDK) — путь для ПК без WHPX в списке компонентов.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $url = 'https://github.com/google/android-emulator-hypervisor-driver/releases/download/v2.2/aehd-windows_v2_2_0.zip'
+    $zip = Get-AndemuCachedZip -Root $Root -FileName 'aehd-windows_v2_2_0.zip' -Url $url -MinBytes 50KB
+    $dest = Join-Path $Root 'runtime\aehd'
+    if (Test-Path -LiteralPath $dest) {
+        Remove-AndemuTempDir -Path $dest
+    }
+    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+    Write-Info 'Распаковываю AEHD...'
+    Expand-AndemuZip -ZipPath $zip -Destination $dest
+
+    $bat = Get-ChildItem -LiteralPath $dest -Recurse -Filter 'silent_install.bat' -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $bat) {
+        throw 'В архиве AEHD не найден silent_install.bat'
+    }
+    return $bat.FullName
+}
+
+function Install-AndemuAehdDriver {
+    param(
+        [string]$SdkRoot,
+        [string]$Root
+    )
+
+    if (-not $Root) { $Root = Get-AndemuRoot }
+    $bat = Find-AndemuAehdSilentInstall -SdkRoot $SdkRoot -Root $Root
+    if (-not $bat) {
+        Write-Info 'Пакет AEHD в SDK не найден — скачиваю с GitHub...'
+        try {
+            $bat = Install-AndemuAehdFromGitHub -Root $Root
+        } catch {
+            Write-Warn "Не удалось скачать AEHD: $($_.Exception.Message)"
+            return $false
+        }
+    }
+
+    Write-Info "Запускаю AEHD installer (нужен UAC/админ): $bat"
     try {
-        $p = Start-Process -FilePath 'dism.exe' -ArgumentList @(
-            '/Online', '/Enable-Feature', '/FeatureName:HypervisorPlatform', '/All', '/NoRestart'
-        ) -Verb RunAs -Wait -PassThru -WindowStyle Normal
-        Write-Info "DISM HypervisorPlatform код: $($p.ExitCode)"
-        # 0 = ok, 3010 = ok but reboot needed
-        return @{ Ok = ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010); Reboot = ($p.ExitCode -eq 3010) }
+        $p = Start-Process -FilePath $env:ComSpec -ArgumentList @('/c', "`"$bat`"") -Verb RunAs -Wait -PassThru -WindowStyle Normal
+        Write-Info "AEHD silent_install код выхода: $($p.ExitCode)"
+        if ($p.ExitCode -ne 0) {
+            Write-Warn 'AEHD installer вернул ошибку. Часто мешает включённый Hyper-V / Memory Integrity / Virtual Machine Platform.'
+        }
+        return ($p.ExitCode -eq 0)
     } catch {
-        Write-Warn "Не удалось включить WHPX: $($_.Exception.Message)"
-        return @{ Ok = $false; Reboot = $false }
+        Write-Warn "Не удалось запустить AEHD с повышением прав: $($_.Exception.Message)"
+        Write-Warn "Запустите от администратора: $bat"
+        return $false
     }
 }
 
 function Ensure-AndemuCpuAcceleration {
     <#
     .SYNOPSIS
-      Проверяет/ставит ускорение CPU (WHPX или AEHD). «Виртуализация» в диспетчере задач ≠ готовый драйвер эмулятора.
+      Ставит AEHD (основной путь, если WHPX нет в компонентах Windows). WHPX — опционально.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$SdkRoot,
         [switch]$AllowInstall
     )
 
+    $root = Get-AndemuRoot
     $accel = Get-AndemuAccelCheckText -SdkRoot $SdkRoot
     if ($accel) {
         Write-DebugLog ("accel-check: " + ($accel.Trim() -replace "`r?`n", ' | '))
@@ -643,32 +691,20 @@ function Ensure-AndemuCpuAcceleration {
         return
     }
 
-    Write-Warn 'CPU acceleration недоступна: нужен WHPX или Android Emulator Hypervisor Driver (AEHD).'
-    Write-Warn 'Галочка «Виртуализация: Включено» в диспетчере задач означает только VT-x в CPU, но не драйвер эмулятора.'
-
-    if (-not $AllowInstall) {
-        throw @"
-Эмулятор x86_64 не запустится без аппаратного ускорения.
-Сделайте одно из двух (нужны права администратора):
-
-A) Включите «Платформа гипервизора Windows» (WHPX):
-   Параметры → Приложения → Дополнительные компоненты → Платформа гипервизора Windows
-   или от админа: dism /Online /Enable-Feature /FeatureName:HypervisorPlatform /All
-
-B) Установите AEHD:
-   runtime\android-sdk\extras\google\Android_Emulator_Hypervisor_Driver\silent_install.bat
-
-Потом перезагрузите ПК при необходимости и снова запустите andemu.
-accel-check:
-$accel
-"@
+    $hv = Test-AndemuHyperVPresent
+    Write-Warn 'CPU acceleration недоступна.'
+    Write-Warn '«Виртуализация» в диспетчере задач ≠ драйвер эмулятора. Нужен AEHD (или WHPX, если IT его откроет).'
+    if ($hv) {
+        Write-Warn 'Обнаружен гипервизор Windows (Hyper-V). AEHD с ним обычно не ставится — нужен WHPX от IT либо отключение Hyper-V.'
     }
 
-    $rebootNeeded = $false
-    $whpx = Enable-AndemuWhpxFeature
-    if ($whpx.Reboot) { $rebootNeeded = $true }
+    if (-not $AllowInstall) {
+        throw (Get-AndemuAccelerationHelpText -AccelText $accel -HyperVPresent:$hv)
+    }
 
-    $null = Install-AndemuAehdDriver -SdkRoot $SdkRoot
+    # WHPX на корпоративных образах часто отсутствует — не считаем это фатальным
+    Write-Info 'Пропускаю принудительное включение WHPX (на многих ПК компонента нет). Ставлю AEHD...'
+    $null = Install-AndemuAehdDriver -SdkRoot $SdkRoot -Root $root
 
     $accel2 = Get-AndemuAccelCheckText -SdkRoot $SdkRoot
     if ($accel2) {
@@ -676,23 +712,45 @@ $accel
     }
 
     if (Test-AndemuAccelOk -AccelText $accel2) {
-        Write-Ok 'CPU acceleration OK после установки'
-        if ($rebootNeeded) {
-            Write-Warn 'DISM просил перезагрузку — если эмулятор всё ещё не стартует, перезагрузите Windows.'
-        }
+        Write-Ok 'CPU acceleration OK (AEHD)'
         return
     }
 
-    throw @"
-Не удалось автоматически включить ускорение эмулятора.
-Сейчас accel-check:
-$accel2
+    throw (Get-AndemuAccelerationHelpText -AccelText $accel2 -HyperVPresent:$hv)
+}
 
-Нужны права администратора и одно из:
-  1) Платформа гипервизора Windows (WHPX) + перезагрузка
-  2) Запуск от админа: runtime\android-sdk\extras\google\Android_Emulator_Hypervisor_Driver\silent_install.bat
+function Get-AndemuAccelerationHelpText {
+    param(
+        [string]$AccelText,
+        [switch]$HyperVPresent
+    )
 
-«Виртуализация включена» в диспетчере задач само по себе недостаточно.
+    $hvBlock = ''
+    if ($HyperVPresent) {
+        $hvBlock = @"
+
+На этом ПК уже работает Hyper-V/гипервизор Windows.
+Тогда AEHD часто НЕ установится. Варианты для IT:
+  • включить компонент «Платформа гипервизора Windows» (HypervisorPlatform) через GPO/DISM
+  • либо отключить Hyper-V / Virtual Machine Platform / Memory Integrity и поставить AEHD
+"@
+    }
+
+    return @"
+Эмулятор x86_64 не запустится без AEHD или WHPX.
+
+Если компонента WHPX нет в списке Windows — это нормально для корпоративных ПК.
+Сделайте так:
+
+1) Дважды кликните Install-AEHD.bat (принять UAC / права администратора)
+2) Если installer напишет ошибку про Hyper-V — попросите IT:
+   - либо дать «Платформа гипервизора Windows»
+   - либо разрешить установку драйвера AEHD и отключить конфликтующие функции Hyper-V
+3) Проверка: runtime\android-sdk\emulator\emulator.exe -accel-check
+$hvBlock
+
+accel-check сейчас:
+$AccelText
 "@
 }
 
@@ -726,16 +784,12 @@ function Get-AndemuEmulatorCrashReason {
 
     if ($tail -match '(?i)hypervisor driver is not installed|requires hardware acceleration') {
         return @"
-Причина: нет драйвера ускорения CPU для Android Emulator (AEHD/WHPX).
-«Виртуализация» в диспетчере задач при этом может быть включена — этого мало.
+Причина: нет драйвера ускорения CPU (AEHD). WHPX на корпоративных ПК часто недоступен — это нормально.
 
-Что сделать (админ):
-  1) Параметры → Приложения → Дополнительные компоненты → включить «Платформа гипервизора Windows»
-  2) Или запустить: runtime\android-sdk\extras\google\Android_Emulator_Hypervisor_Driver\silent_install.bat
-  3) Перезагрузить ПК и снова Start-TSD-Emulator.vbs
-
-Повторите setup (он попробует поставить драйвер сам) или пришлите вывод:
-  runtime\android-sdk\emulator\emulator.exe -accel-check
+Сделайте:
+  1) Запустите Install-AEHD.bat (принять UAC)
+  2) Если ошибка про Hyper-V — попросите IT дать WHPX или отключить Hyper-V для AEHD
+  3) Проверка: runtime\android-sdk\emulator\emulator.exe -accel-check
 "@
     }
     return $null
