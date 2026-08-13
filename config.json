@@ -16,6 +16,7 @@
   "emulatorArgs": [
     "-no-snapshot-save",
     "-no-snapshot-load",
+    "-no-metrics",
     "-gpu",
     "swiftshader_indirect"
   ],

@@ -231,7 +231,8 @@ function Install-SdkPackages {
         'emulator',
         'build-tools;30.0.3',
         ("platforms;" + $Config.androidApi),
-        $Config.systemImage
+        $Config.systemImage,
+        'extras;google;Android_Emulator_Hypervisor_Driver'
     )
 
     Write-Info "Устанавливаю пакеты SDK:"
@@ -366,6 +367,8 @@ try {
 
     Accept-Licenses -SdkManager $sdkManager
     Install-SdkPackages -SdkManager $sdkManager -Config $config
+    # WHPX / AEHD: «Виртуализация» в диспетчере задач ≠ драйвер эмулятора
+    Ensure-AndemuCpuAcceleration -SdkRoot $sdkRoot -AllowInstall
     New-TsdAvd -AvdManager $avdManager -Config $config -AvdHome $avdHome
     $null = Update-AndemuAvdDisplay -Config $config -AvdHome $avdHome
 

@@ -549,6 +549,198 @@ function Clear-AndemuSetupCache {
     }
 }
 
+function Get-AndemuAccelCheckText {
+    param([Parameter(Mandatory = $true)][string]$SdkRoot)
+
+    $emu = Join-Path $SdkRoot 'emulator\emulator.exe'
+    if (-not (Test-Path -LiteralPath $emu)) { return $null }
+
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $emu -accel-check 2>&1 | Out-String
+    } catch {
+        $out = $_.Exception.Message
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return $out
+}
+
+function Test-AndemuAccelOk {
+    param([string]$AccelText)
+    if (-not $AccelText) { return $false }
+    # Типичные OK-строки accel-check / рабочего эмулятора
+    if ($AccelText -match '(?i)AEHD\s+\(.*\)\s+is\s+installed\s+and\s+usable') { return $true }
+    if ($AccelText -match '(?i)WHPX\s+\(.*\)\s+is\s+installed\s+and\s+usable') { return $true }
+    if ($AccelText -match '(?i)Windows Hypervisor Platform \(WHPX\) is available and enabled') { return $true }
+    if ($AccelText -match '(?i)accel\s*=\s*(aehd|whpx|hax)') { return $true }
+    if ($AccelText -match '(?i)is\s+operational') { return $true }
+    # Явный fail
+    if ($AccelText -match '(?i)hypervisor driver is not installed') { return $false }
+    if ($AccelText -match '(?i)not installed on this machine') { return $false }
+    return $false
+}
+
+function Install-AndemuAehdDriver {
+    param([string]$SdkRoot)
+
+    $bat = Join-Path $SdkRoot 'extras\google\Android_Emulator_Hypervisor_Driver\silent_install.bat'
+    if (-not (Test-Path -LiteralPath $bat)) {
+        $alt = Get-ChildItem -LiteralPath (Join-Path $SdkRoot 'extras') -Recurse -Filter 'silent_install.bat' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($alt) { $bat = $alt.FullName }
+    }
+    if (-not (Test-Path -LiteralPath $bat)) {
+        Write-Warn "AEHD silent_install.bat не найден (сначала установите пакет extras;google;Android_Emulator_Hypervisor_Driver)"
+        return $false
+    }
+
+    Write-Info 'Запускаю silent_install.bat AEHD (может запросить права администратора)...'
+    try {
+        $p = Start-Process -FilePath $env:ComSpec -ArgumentList @('/c', "`"$bat`"") -Verb RunAs -Wait -PassThru -WindowStyle Normal
+        Write-Info "AEHD silent_install код выхода: $($p.ExitCode)"
+        return ($p.ExitCode -eq 0)
+    } catch {
+        Write-Warn "Не удалось запустить AEHD installer с повышением прав: $($_.Exception.Message)"
+        Write-Warn "Запустите от администратора: $bat"
+        return $false
+    }
+}
+
+function Enable-AndemuWhpxFeature {
+    Write-Info 'Пробую включить Windows Hypervisor Platform (WHPX)...'
+    try {
+        $p = Start-Process -FilePath 'dism.exe' -ArgumentList @(
+            '/Online', '/Enable-Feature', '/FeatureName:HypervisorPlatform', '/All', '/NoRestart'
+        ) -Verb RunAs -Wait -PassThru -WindowStyle Normal
+        Write-Info "DISM HypervisorPlatform код: $($p.ExitCode)"
+        # 0 = ok, 3010 = ok but reboot needed
+        return @{ Ok = ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010); Reboot = ($p.ExitCode -eq 3010) }
+    } catch {
+        Write-Warn "Не удалось включить WHPX: $($_.Exception.Message)"
+        return @{ Ok = $false; Reboot = $false }
+    }
+}
+
+function Ensure-AndemuCpuAcceleration {
+    <#
+    .SYNOPSIS
+      Проверяет/ставит ускорение CPU (WHPX или AEHD). «Виртуализация» в диспетчере задач ≠ готовый драйвер эмулятора.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$SdkRoot,
+        [switch]$AllowInstall
+    )
+
+    $accel = Get-AndemuAccelCheckText -SdkRoot $SdkRoot
+    if ($accel) {
+        Write-DebugLog ("accel-check: " + ($accel.Trim() -replace "`r?`n", ' | '))
+    }
+
+    if (Test-AndemuAccelOk -AccelText $accel) {
+        Write-Ok 'CPU acceleration OK (WHPX/AEHD)'
+        return
+    }
+
+    Write-Warn 'CPU acceleration недоступна: нужен WHPX или Android Emulator Hypervisor Driver (AEHD).'
+    Write-Warn 'Галочка «Виртуализация: Включено» в диспетчере задач означает только VT-x в CPU, но не драйвер эмулятора.'
+
+    if (-not $AllowInstall) {
+        throw @"
+Эмулятор x86_64 не запустится без аппаратного ускорения.
+Сделайте одно из двух (нужны права администратора):
+
+A) Включите «Платформа гипервизора Windows» (WHPX):
+   Параметры → Приложения → Дополнительные компоненты → Платформа гипервизора Windows
+   или от админа: dism /Online /Enable-Feature /FeatureName:HypervisorPlatform /All
+
+B) Установите AEHD:
+   runtime\android-sdk\extras\google\Android_Emulator_Hypervisor_Driver\silent_install.bat
+
+Потом перезагрузите ПК при необходимости и снова запустите andemu.
+accel-check:
+$accel
+"@
+    }
+
+    $rebootNeeded = $false
+    $whpx = Enable-AndemuWhpxFeature
+    if ($whpx.Reboot) { $rebootNeeded = $true }
+
+    $null = Install-AndemuAehdDriver -SdkRoot $SdkRoot
+
+    $accel2 = Get-AndemuAccelCheckText -SdkRoot $SdkRoot
+    if ($accel2) {
+        Write-DebugLog ("accel-check (after): " + ($accel2.Trim() -replace "`r?`n", ' | '))
+    }
+
+    if (Test-AndemuAccelOk -AccelText $accel2) {
+        Write-Ok 'CPU acceleration OK после установки'
+        if ($rebootNeeded) {
+            Write-Warn 'DISM просил перезагрузку — если эмулятор всё ещё не стартует, перезагрузите Windows.'
+        }
+        return
+    }
+
+    throw @"
+Не удалось автоматически включить ускорение эмулятора.
+Сейчас accel-check:
+$accel2
+
+Нужны права администратора и одно из:
+  1) Платформа гипервизора Windows (WHPX) + перезагрузка
+  2) Запуск от админа: runtime\android-sdk\extras\google\Android_Emulator_Hypervisor_Driver\silent_install.bat
+
+«Виртуализация включена» в диспетчере задач само по себе недостаточно.
+"@
+}
+
+function Get-AndemuEmulatorLogTail {
+    param(
+        [string]$Root,
+        [int]$Lines = 40
+    )
+    $err = Join-Path $Root 'logs\emulator-stderr.log'
+    $out = Join-Path $Root 'logs\emulator-stdout.log'
+    $chunks = @()
+    foreach ($f in @($err, $out)) {
+        if (Test-Path -LiteralPath $f) {
+            try {
+                $tail = Get-Content -LiteralPath $f -Tail $Lines -ErrorAction SilentlyContinue
+                if ($tail) {
+                    $chunks += ("--- $(Split-Path $f -Leaf) ---")
+                    $chunks += ($tail -join [Environment]::NewLine)
+                }
+            } catch {}
+        }
+    }
+    return ($chunks -join [Environment]::NewLine)
+}
+
+function Get-AndemuEmulatorCrashReason {
+    param([string]$Root)
+
+    $tail = Get-AndemuEmulatorLogTail -Root $Root -Lines 80
+    if (-not $tail) { return $null }
+
+    if ($tail -match '(?i)hypervisor driver is not installed|requires hardware acceleration') {
+        return @"
+Причина: нет драйвера ускорения CPU для Android Emulator (AEHD/WHPX).
+«Виртуализация» в диспетчере задач при этом может быть включена — этого мало.
+
+Что сделать (админ):
+  1) Параметры → Приложения → Дополнительные компоненты → включить «Платформа гипервизора Windows»
+  2) Или запустить: runtime\android-sdk\extras\google\Android_Emulator_Hypervisor_Driver\silent_install.bat
+  3) Перезагрузить ПК и снова Start-TSD-Emulator.vbs
+
+Повторите setup (он попробует поставить драйвер сам) или пришлите вывод:
+  runtime\android-sdk\emulator\emulator.exe -accel-check
+"@
+    }
+    return $null
+}
+
 function Update-AndemuAvdDisplay {
     <#
     .SYNOPSIS

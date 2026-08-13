@@ -80,21 +80,7 @@ function Get-EmulatorLogTail {
         [string]$Root,
         [int]$Lines = 40
     )
-    $err = Join-Path $Root 'logs\emulator-stderr.log'
-    $out = Join-Path $Root 'logs\emulator-stdout.log'
-    $chunks = @()
-    foreach ($f in @($err, $out)) {
-        if (Test-Path -LiteralPath $f) {
-            try {
-                $tail = Get-Content -LiteralPath $f -Tail $Lines -ErrorAction SilentlyContinue
-                if ($tail) {
-                    $chunks += ("--- $(Split-Path $f -Leaf) ---")
-                    $chunks += ($tail -join [Environment]::NewLine)
-                }
-            } catch {}
-        }
-    }
-    return ($chunks -join [Environment]::NewLine)
+    return (Get-AndemuEmulatorLogTail -Root $Root -Lines $Lines)
 }
 
 function Wait-ForBootCompleted {
@@ -115,10 +101,11 @@ function Wait-ForBootCompleted {
             if (-not $alive) {
                 $tail = Get-EmulatorLogTail -Root $root
                 if ($tail) { Write-DebugLog $tail }
+                $reason = Get-AndemuEmulatorCrashReason -Root $root
+                if ($reason) { throw $reason }
                 throw @"
 Процесс эмулятора завершился до подключения adb (PID $EmulatorPid).
-Смотрите logs\emulator-stderr.log — там обычно точная причина
-(драйвер GPU/hypervisor, антивирус, нехватка RAM и т.п.).
+Смотрите logs\emulator-stdout.log / emulator-stderr.log
 "@
             }
         }
@@ -140,11 +127,12 @@ function Wait-ForBootCompleted {
     if (-not $deviceSeen) {
         $tail = Get-EmulatorLogTail -Root $root
         if ($tail) { Write-DebugLog $tail }
+        $reason = Get-AndemuEmulatorCrashReason -Root $root
+        if ($reason) { throw $reason }
         throw @"
 Таймаут: эмулятор не появился в adb за $TimeoutSec сек.
-Если в Диспетчере задач виртуализация уже включена — откройте logs\emulator-stderr.log
-и пришлите хвост файла (или проверьте, не блокирует ли антивирус qemu-system*.exe).
-Также полезно вручную: runtime\android-sdk\emulator\emulator.exe -accel-check
+Смотрите logs\emulator-stdout.log и выполните:
+  runtime\android-sdk\emulator\emulator.exe -accel-check
 "@
     }
 
@@ -447,6 +435,9 @@ APK не найден: $apkPath
     Write-Ok "APK найден: $apkPath"
 
     Set-SdkEnvironment -SdkRoot $sdkRoot -AvdHome $avdHome
+
+    # До запуска эмулятора: без AEHD/WHPX x86_64 сразу падает
+    Ensure-AndemuCpuAcceleration -SdkRoot $sdkRoot -AllowInstall
 
     # Всегда синхронизируем экран AVD с config.json (раньше правки не попадали в уже созданный AVD)
     $displayChanged = Update-AndemuAvdDisplay -Config $config -AvdHome $avdHome
