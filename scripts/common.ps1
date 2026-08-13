@@ -155,6 +155,208 @@ function Set-IniValue {
     return ,$result
 }
 
+function Get-JavaMajorVersion {
+    param([string]$JavaExe)
+    if (-not (Test-Path -LiteralPath $JavaExe)) { return $null }
+    try {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $out = & $JavaExe -version 2>&1 | Out-String
+        $ErrorActionPreference = $prevEap
+    } catch {
+        return $null
+    }
+    if ($out -match 'version\s+"1\.(\d+)') {
+        return [int]$Matches[1]
+    }
+    if ($out -match 'version\s+"(\d+)') {
+        return [int]$Matches[1]
+    }
+    return $null
+}
+
+function Resolve-JavaHomeFromExe {
+    param([string]$JavaExe)
+    if (-not (Test-Path -LiteralPath $JavaExe)) { return $null }
+
+    $binDir = Split-Path -Parent $JavaExe
+    if ((Split-Path -Leaf $binDir) -ieq 'bin') {
+        $candidate = Split-Path -Parent $binDir
+        if (Test-Path -LiteralPath (Join-Path $candidate 'bin\java.exe')) {
+            return $candidate
+        }
+    }
+
+    # Oracle javapath и подобные stub'ы — спрашиваем JVM
+    try {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $out = & $JavaExe -XshowSettings:properties -version 2>&1 | Out-String
+        $ErrorActionPreference = $prevEap
+    } catch {
+        return $null
+    }
+
+    if ($out -match '(?m)^\s*java\.home\s*=\s*(.+?)\s*$') {
+        $jh = $Matches[1].Trim()
+        if ((Split-Path -Leaf $jh) -ieq 'jre') {
+            $parent = Split-Path -Parent $jh
+            if (Test-Path -LiteralPath (Join-Path $parent 'bin\javac.exe')) {
+                return $parent
+            }
+        }
+        return $jh
+    }
+    return $null
+}
+
+function Test-AndemuJdkHome {
+    param(
+        [string]$JdkHome,
+        [int]$MinMajor = 17
+    )
+    if (-not $JdkHome) { return $false }
+    $javaExe = Join-Path $JdkHome 'bin\java.exe'
+    $javacExe = Join-Path $JdkHome 'bin\javac.exe'
+    # sdkmanager надёжнее работает с полноценным JDK (javac)
+    if (-not (Test-Path -LiteralPath $javaExe)) { return $false }
+    if (-not (Test-Path -LiteralPath $javacExe)) { return $false }
+    $major = Get-JavaMajorVersion -JavaExe $javaExe
+    return ($null -ne $major -and $major -ge $MinMajor)
+}
+
+function Find-UsableJdkHome {
+    <#
+    .SYNOPSIS
+      Ищет JDK 17+ : portable runtime\jdk, JAVA_HOME, java в PATH.
+    #>
+    param(
+        [string]$Root,
+        [int]$MinMajor = 17
+    )
+
+    $candidates = @()
+    if ($Root) {
+        $candidates += (Join-Path $Root 'runtime\jdk')
+    }
+    if ($env:JAVA_HOME) {
+        $candidates += $env:JAVA_HOME.TrimEnd('\', '/')
+    }
+
+    foreach ($jdkDir in $candidates) {
+        if (Test-AndemuJdkHome -JdkHome $jdkDir -MinMajor $MinMajor) {
+            return $jdkDir
+        }
+    }
+
+    $cmd = Get-Command java.exe -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) {
+        $jdkDir = Resolve-JavaHomeFromExe -JavaExe $cmd.Source
+        if (Test-AndemuJdkHome -JdkHome $jdkDir -MinMajor $MinMajor) {
+            return $jdkDir
+        }
+    }
+
+    return $null
+}
+
+function Set-AndemuJavaEnvironment {
+    param([string]$JavaHome)
+    if (-not $JavaHome) { return }
+    $env:JAVA_HOME = $JavaHome
+    $bin = Join-Path $JavaHome 'bin'
+    if ($env:PATH -notlike "*$bin*") {
+        $env:PATH = "$bin;$env:PATH"
+    }
+}
+
+function Install-PortableTemurinJdk {
+    param(
+        [string]$Root,
+        [int]$Major = 17,
+        [string]$ZipUrl = 'https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse?project=jdk'
+    )
+
+    $jdkHome = Join-Path $Root 'runtime\jdk'
+    $javaExe = Join-Path $jdkHome 'bin\java.exe'
+    if (Test-Path -LiteralPath $javaExe) {
+        $major = Get-JavaMajorVersion -JavaExe $javaExe
+        if ($null -ne $major -and $major -ge $Major) {
+            Write-Ok "Portable JDK уже установлен: $jdkHome (Java $major)"
+            return $jdkHome
+        }
+    }
+
+    Write-Info "Скачиваю portable Eclipse Temurin JDK $Major (~180 MB)..."
+    Write-Info "URL: $ZipUrl"
+
+    $runtimeDir = Join-Path $Root 'runtime'
+    if (-not (Test-Path -LiteralPath $runtimeDir)) {
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+    }
+
+    $tempDir = Join-Path $env:TEMP ('andemu-jdk-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+    $zipPath = Join-Path $tempDir 'temurin-jdk.zip'
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $ZipUrl -OutFile $zipPath -UseBasicParsing
+
+        Write-Info 'Распаковываю JDK...'
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $tempDir -Force
+
+        $extractedHome = Get-ChildItem -LiteralPath $tempDir -Directory |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'bin\java.exe') } |
+            Select-Object -First 1
+
+        if (-not $extractedHome) {
+            throw 'В архиве JDK не найден bin\java.exe'
+        }
+
+        if (Test-Path -LiteralPath $jdkHome) {
+            Remove-Item -LiteralPath $jdkHome -Recurse -Force
+        }
+        Move-Item -LiteralPath $extractedHome.FullName -Destination $jdkHome
+
+        $major = Get-JavaMajorVersion -JavaExe (Join-Path $jdkHome 'bin\java.exe')
+        if ($null -eq $major -or $major -lt $Major) {
+            throw "После установки JDK версия недостаточна (нужна $Major+, получена: $major)"
+        }
+
+        Write-Ok "JDK установлен: $jdkHome (Java $major)"
+        return $jdkHome
+    } catch {
+        throw "Не удалось установить portable JDK. Проверьте интернет и доступ к api.adoptium.net. $($_.Exception.Message)"
+    } finally {
+        try { Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+    }
+}
+
+function Ensure-AndemuJdk {
+    <#
+    .SYNOPSIS
+      Гарантирует JDK 17+ для sdkmanager: использует системный или качает portable в runtime\jdk.
+    #>
+    param(
+        [string]$Root,
+        [int]$MinMajor = 17
+    )
+
+    $found = Find-UsableJdkHome -Root $Root -MinMajor $MinMajor
+    if ($found) {
+        Set-AndemuJavaEnvironment -JavaHome $found
+        $ver = Get-JavaMajorVersion -JavaExe (Join-Path $found 'bin\java.exe')
+        Write-Ok ("Java {0}: {1}" -f $ver, $found)
+        return $found
+    }
+
+    Write-Warn "JDK $MinMajor+ не найден на ПК — скачаю portable в runtime\jdk"
+    $installed = Install-PortableTemurinJdk -Root $Root -Major $MinMajor
+    Set-AndemuJavaEnvironment -JavaHome $installed
+    return $installed
+}
+
 function Update-AndemuAvdDisplay {
     <#
     .SYNOPSIS

@@ -337,20 +337,9 @@ try {
     $null = Initialize-AndemuLog -Name setup -Root $root
     Write-Info "Корень проекта: $root"
 
-    # Диагностика Java (нужна для sdkmanager)
-    $javaCmd = Get-Command java -ErrorAction SilentlyContinue
-    if ($javaCmd) {
-        Write-Info "Java: $($javaCmd.Source)"
-        try {
-            $javaVer = & java -version 2>&1 | Out-String
-            Write-DebugLog ("java -version: " + ($javaVer.Trim() -replace "`r?`n", ' | '))
-        } catch {}
-    } else {
-        Write-Warn "java не найдена в PATH. sdkmanager обычно требует JDK 17+. Если setup упадёт — установите Temurin/Oracle JDK и повторите."
-    }
-    if ($env:JAVA_HOME) {
-        Write-Info "JAVA_HOME=$env:JAVA_HOME"
-    }
+    # JDK 17+ нужен sdkmanager/avdmanager (системный или portable runtime\jdk)
+    $null = Ensure-AndemuJdk -Root $root -MinMajor 17
+    Write-DebugLog "JAVA_HOME=$env:JAVA_HOME"
 
     $config = Read-Config -Root $root
     Write-DebugLog ("config: api=$($config.androidApi); image=$($config.systemImage); avd=$($config.avdName)")

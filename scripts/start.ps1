@@ -421,20 +421,31 @@ APK не найден: $apkPath
     }
     Complete-AndemuLog -ExitCode 1
 
-    # При скрытом запуске из bat — показать ошибку в MessageBox
+    # При скрытом запуске — показать ошибку в MessageBox (Unicode через WinForms)
     if ($env:ANDEMU_HIDDEN -eq '1') {
         $msg = $_.Exception.Message
         $logHint = Join-Path (Get-AndemuRoot) 'logs\start-latest.log'
+        $ui = Join-Path $PSScriptRoot 'ui-message.ps1'
+        $detail = $msg + [Environment]::NewLine + [Environment]::NewLine + 'Log: ' + $logHint
         try {
-            Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-            [void][System.Windows.Forms.MessageBox]::Show(
-                ($msg + [Environment]::NewLine + [Environment]::NewLine + "Лог: " + $logHint),
-                'andemu — ошибка запуска',
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Error
-            )
+            if (Test-Path -LiteralPath $ui) {
+                Start-Process -FilePath 'powershell.exe' -Wait -WindowStyle Normal -ArgumentList @(
+                    '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                    '-File', $ui,
+                    '-Id', 'StartFailed',
+                    '-Detail', $detail
+                ) | Out-Null
+            } else {
+                Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+                [void][System.Windows.Forms.MessageBox]::Show(
+                    $detail,
+                    'andemu - start error',
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                )
+            }
         } catch {
-            Start-Process -FilePath $env:ComSpec -ArgumentList @('/c', "echo ERROR: $msg & echo Log: $logHint & pause")
+            Start-Process -FilePath $env:ComSpec -ArgumentList @('/c', "echo ERROR & echo Log: $logHint & pause")
         }
     }
     exit 1
