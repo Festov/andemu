@@ -75,23 +75,91 @@ function Invoke-AdbText {
     }
 }
 
+function Get-EmulatorLogTail {
+    param(
+        [string]$Root,
+        [int]$Lines = 40
+    )
+    $err = Join-Path $Root 'logs\emulator-stderr.log'
+    $out = Join-Path $Root 'logs\emulator-stdout.log'
+    $chunks = @()
+    foreach ($f in @($err, $out)) {
+        if (Test-Path -LiteralPath $f) {
+            try {
+                $tail = Get-Content -LiteralPath $f -Tail $Lines -ErrorAction SilentlyContinue
+                if ($tail) {
+                    $chunks += ("--- $(Split-Path $f -Leaf) ---")
+                    $chunks += ($tail -join [Environment]::NewLine)
+                }
+            } catch {}
+        }
+    }
+    return ($chunks -join [Environment]::NewLine)
+}
+
 function Wait-ForBootCompleted {
     param(
         [string]$Adb,
-        [int]$TimeoutSec = 120
+        [int]$TimeoutSec = 180,
+        [int]$EmulatorPid = 0
     )
 
-    Write-Info "Ожидаю device (adb wait-for-device)..."
-    $wait = Invoke-AdbText -Adb $Adb -AdbArgs @('wait-for-device')
-    if ($wait.Text) { Write-DebugLog ("wait-for-device: " + ($wait.Text.Trim() -replace "`r?`n", ' | ')) }
-    if ($wait.ExitCode -ne 0) {
-        throw "adb wait-for-device завершился с ошибкой"
+    $root = Get-AndemuRoot
+    Write-Info "Ожидаю появления эмулятора в adb (до $TimeoutSec сек)..."
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $deviceSeen = $false
+
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        if ($EmulatorPid -gt 0) {
+            $alive = Get-Process -Id $EmulatorPid -ErrorAction SilentlyContinue
+            if (-not $alive) {
+                $tail = Get-EmulatorLogTail -Root $root
+                if ($tail) { Write-DebugLog $tail }
+                throw @"
+Процесс эмулятора завершился до подключения adb (PID $EmulatorPid).
+Смотрите logs\emulator-stderr.log — там обычно точная причина
+(драйвер GPU/hypervisor, антивирус, нехватка RAM и т.п.).
+"@
+            }
+        }
+
+        $dev = Invoke-AdbText -Adb $Adb -AdbArgs @('devices')
+        $text = if ($dev.Text) { $dev.Text } else { '' }
+        if ($text -match "emulator-\d+\s+device") {
+            $deviceSeen = $true
+            Write-Ok ("adb device online ({0} сек)" -f [int]$sw.Elapsed.TotalSeconds)
+            break
+        }
+        if ($text -match "emulator-\d+\s+offline") {
+            Write-Info "Эмулятор в adb пока offline..."
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    if (-not $deviceSeen) {
+        $tail = Get-EmulatorLogTail -Root $root
+        if ($tail) { Write-DebugLog $tail }
+        throw @"
+Таймаут: эмулятор не появился в adb за $TimeoutSec сек.
+Если в Диспетчере задач виртуализация уже включена — откройте logs\emulator-stderr.log
+и пришлите хвост файла (или проверьте, не блокирует ли антивирус qemu-system*.exe).
+Также полезно вручную: runtime\android-sdk\emulator\emulator.exe -accel-check
+"@
     }
 
     Write-Info "Ожидаю sys.boot_completed (до $TimeoutSec сек)..."
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $sw.Restart()
     while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-        $boot = (Invoke-AdbText -Adb $Adb -AdbArgs @('shell', 'getprop', 'sys.boot_completed')).Text.Trim()
+        if ($EmulatorPid -gt 0) {
+            $alive = Get-Process -Id $EmulatorPid -ErrorAction SilentlyContinue
+            if (-not $alive) {
+                throw "Процесс эмулятора завершился во время загрузки Android."
+            }
+        }
+
+        $boot = (Invoke-AdbText -Adb $Adb -AdbArgs @('shell', 'getprop', 'sys.boot_completed')).Text
+        if ($boot) { $boot = $boot.Trim() }
         if ($boot -eq '1') {
             Start-Sleep -Seconds 3
             Write-Ok "Эмулятор загружен ($([int]$sw.Elapsed.TotalSeconds) сек)"
@@ -99,7 +167,10 @@ function Wait-ForBootCompleted {
         }
         Start-Sleep -Seconds 2
     }
-    throw "Таймаут ожидания загрузки эмулятора ($TimeoutSec сек). Проверьте виртуализацию (WHPX/Hyper-V) и логи emulator."
+
+    $tail = Get-EmulatorLogTail -Root $root
+    if ($tail) { Write-DebugLog $tail }
+    throw "Таймаут ожидания загрузки эмулятора ($TimeoutSec сек). Проверьте виртуализацию (WHPX/Hyper-V) и logs\emulator-stderr.log"
 }
 
 function Find-Aapt {
@@ -250,25 +321,18 @@ function Start-EmulatorProcess {
     Write-Info ("Запускаю: emulator.exe " + ($argList -join ' '))
     Write-DebugLog "emulator logs: $emuLogDir"
 
-    # CreateNoWindow: без чёрной консоли; Qt-окно устройства остаётся видимым
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $EmulatorExe
-    $psi.Arguments = ($argList | ForEach-Object {
-        $a = [string]$_
-        if ($a -match '[\s"]') { '"' + ($a -replace '"', '\"') + '"' } else { $a }
-    }) -join ' '
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.WorkingDirectory = Split-Path -Parent $EmulatorExe
-    foreach ($key in @('ANDROID_SDK_ROOT', 'ANDROID_HOME', 'ANDROID_AVD_HOME', 'ANDROID_SDK_HOME', 'PATH')) {
-        if (Get-Item "Env:$key" -ErrorAction SilentlyContinue) {
-            $psi.EnvironmentVariables[$key] = (Get-Item "Env:$key").Value
-        }
-    }
+    # Redirect логов + без лишней консоли; Qt-окно эмулятора всё равно появится
+    $proc = Start-Process -FilePath $EmulatorExe `
+        -ArgumentList $argList `
+        -WorkingDirectory (Split-Path -Parent $EmulatorExe) `
+        -PassThru `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $emuStdout `
+        -RedirectStandardError $emuStderr
 
-    $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo = $psi
-    $null = $proc.Start()
+    if (-not $proc) {
+        throw "Не удалось запустить emulator.exe"
+    }
     Write-Ok "Процесс эмулятора PID=$($proc.Id)"
     return $proc
 }
@@ -387,8 +451,10 @@ APK не найден: $apkPath
     # Всегда синхронизируем экран AVD с config.json (раньше правки не попадали в уже созданный AVD)
     $displayChanged = Update-AndemuAvdDisplay -Config $config -AvdHome $avdHome
 
-    $null = Start-EmulatorProcess -EmulatorExe $emulatorExe -Config $config -ForceRestart:$displayChanged
-    Wait-ForBootCompleted -Adb $adb -TimeoutSec 180
+    $emuProc = Start-EmulatorProcess -EmulatorExe $emulatorExe -Config $config -ForceRestart:$displayChanged
+    $emuPid = 0
+    if ($emuProc -and $emuProc.Id) { $emuPid = [int]$emuProc.Id }
+    Wait-ForBootCompleted -Adb $adb -TimeoutSec 180 -EmulatorPid $emuPid
     Lock-PortraitOrientation -Adb $adb
 
     # Скрыть боковую панель с rotate; кнопки питания/закрытия — в заголовке
